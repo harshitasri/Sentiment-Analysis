@@ -1,0 +1,144 @@
+################## Setting up twitter authentication ###################
+
+library(twitteR)
+library(ROAuth)
+require(RCurl)
+library(stringr)
+library(tm)
+library(plyr)
+library(dplyr)
+library(tm)
+library(wordcloud)
+library(text2vec)
+library(rpart)
+library(caTools)
+getwd()
+download.file(url="http://curl.haxx.se/ca/cacert.pem",destfile="cacert.pem")
+
+#create an object "cred" that will save the authenticated object that we can use for later sessions
+
+consumer_key = "qEApOw745dRvSLU40678ftVm1"
+consumer_secret = "Hz1uc41N67mtTrYRjsrZmVwH8IEvRLf3ITz8kHkUhorZk5moNo"
+token_secret = "iQDM4Ic3OQwOS1GaFryRIEt3n9GeHSopPbsjQpe27ibtT"
+access_token = "858344615879077894-jONGcGfU5HOHloYqT8px5pfwf453tRt"
+cred <- OAuthFactory$new(consumerKey = consumer_key,
+                                 consumerSecret = consumer_secret,
+                                 requestURL="https://api.twitter.com/oauth/request_token",
+                                 accessURL="https://api.twitter.com/oauth/access_token",
+                                 authURL="https://api.twitter.com/oauth/authorize")
+cred$handshake(cainfo="cacert.pem")
+setup_twitter_oauth(consumer_key, consumer_secret, access_token, token_secret)
+
+####################### WEB SCRAPPING ############################
+
+Android <- searchTwitter("android + phone + review", n=10000, lang='en', since=format(Sys.Date()-50))
+IOS <- searchTwitter("iphone + ios + review", n=10000, lang='en', since=format(Sys.Date()-50))
+head(Android)
+head(IOS)
+android_txt <- sapply(Android, function(x) x$getText())
+IOS_txt <- sapply(IOS, function(x) x$getText())
+NumTweets <- c(length(android_txt), length(IOS_txt))
+tweets <- c(android_txt, IOS_txt)
+head(tweets)
+
+################ Load positive and negative words file #################
+
+pos = readLines("Positivewords.txt")
+neg = readLines("Negativewords.txt")
+
+################ Sentiment Analysis ####################
+#apply function score.sentiment
+scores <- score.sentiment(tweets, pos, neg, .progress='text')
+
+########## add variables to a data frame ################
+scores$OS = factor(rep(c( "Android","IOS"),NumTweets))
+scores$very.pos = as.numeric(scores$score >= 2)
+scores$very.neg = as.numeric(scores$score <= -2)
+############# how many very positives and very negatives #####################
+numpos <- sum(scores$very.pos)
+numneg <- sum(scores$very.neg)
+
+############## Calculating the global score #################
+global_score = paste0(round(100 * numpos / (numpos + numneg)),"%")
+global_score
+boxplot(score~OS, data=scores, col='blue')
+
+############## Bar Graph ##################
+
+meanscore = tapply(scores$score, scores$OS, mean)
+df = data.frame(scores=names(meanscore), meanscore=meanscore)
+df$scores <- reorder(df$scores, df$meanscore)
+library(ggplot2)
+ggplot(df, aes(x=scores,y = meanscore,color="Yellow")) +geom_bar(stat = "identity",color="red")
+
+############# Predicting the Sentiment of Tweets ####################
+
+install.packages("SnowballC",repos='http://cran.us.r-project.org')
+install.packages("rpart.plot", repos='http://cran.us.r-project.org')
+install.packages("ROCR", repos='http://cran.us.r-project.org')
+install.packages('randomForest', repos='http://cran.us.r-project.org')
+library(SnowballC)
+library(rpart.plot)
+library(ROCR)
+library(randomForest)
+tweetCorpus <- Corpus(VectorSource(tweets))
+
+#################### remove punctuation marks ##########################
+
+tweetsCorpus <- tm_map(tweetCorpus, removePunctuation)
+cloudCorpus <- tm_map(tweetsCorpus, stemDocument)
+wordcloud(cloudCorpus, max.words = 100, random.order = FALSE)
+
+################## remove stopwords #######################
+
+tweetsCorpus <- tm_map(tweetsCorpus, removeWords, c("Android", "IOS", stopwords("english")))
+tweet_dtm <- tm_map(tweetsCorpus, PlainTextDocument)
+dtm <- DocumentTermMatrix(tweetsCorpus, control = list(removePunctuation = TRUE, stopwords=TRUE))
+inspect(dtm)
+plot(dtm)
+length(findFreqTerms(dtm, lowfreq=30)) # this find the words that appears at least 30 times
+sparseTerms <- removeSparseTerms(dtm, 0.995)
+sparseTerms
+dataframe <- as.data.frame(as.matrix(sparseTerms))
+colnames(dataframe) <- make.names(colnames(dataframe))
+dataframe <- as.data.frame(as.matrix(sparseTerms))
+colnames(dataframe) <- make.names(colnames(dataframe))
+dataframe$Negative <- as.factor(scores$score <=-1)
+dataframe$score <- NULL
+dataframe$Score <-NULL
+
+############ The predictive models #################
+
+set.seed(1000)
+library(caTools)
+split <- sample.split(dataframe$Negative, SplitRatio=0.7)
+trainData <- subset(dataframe, split==TRUE)
+testData <- subset(dataframe, split==FALSE)
+modelCART <- rpart(Negative ~., data=trainData, method="class",control=rpart.control(minsplit=1, minbucket=1, cp=0.001))
+prp(modelCART)
+
+############## make prediction ##################
+predictCART <- predict(modelCART, newdata = testData, type="class")
+table(testData$Negative, predictCART)
+############## Accurary ######################
+misClasificError <- mean(predictCART != testData$Negative)
+print(paste('Accuracy',1-misClasificError))
+
+############## ROC Curve #####################
+Prediction_ROC <- predict(modelCART, newdata = testData)
+pred <- prediction(Prediction_ROC[,2], testData$Negative)
+perf <- performance(pred, "tpr", "fpr")
+plot(perf, colorize = TRUE)
+
+############ Area under ROC Curve ################
+performance(pred, "auc")@y.values
+
+########### Random forest model ###################
+
+modelForest <- randomForest(Negative ~ ., data = trainData, nodesize = 25, ntrees = 200)
+predictForest <- predict(modelForest, newdata = testData)
+table(testData$Negative, predictForest)
+misClasificError <- mean(predictForest != testData$Negative)
+print(paste('Accuracy',1-misClasificError))
+
+################################################################################################
